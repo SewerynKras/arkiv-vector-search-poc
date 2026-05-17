@@ -1,0 +1,64 @@
+# ─── Node / pnpm ────────────────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── TypeScript / tooling caches ────────────────────────────────────────────
+*.tsbuildinfo
+.eslintcache
+.prettiercache
+
+# ─── Next.js / Turbopack ────────────────────────────────────────────────────
+.next/
+.turbo/
+out/                 # next export bundle
+.vercel/
+.cache/
+dist/
+
+# ─── Environment / secrets ──────────────────────────────────────────────────
+# .env contains the indexer's PRIVATE_KEY — must never be committed.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ─── Indexer / server data (huge, regenerable) ─────────────────────────────
+# raw_articles.jsonl   ~62 MB
+# chunks.jsonl         ~60 MB
+# embeddings.f32       ~150 MB
+# centroids.f32, assignments.* — regenerable from the steps above.
+indexer/data/
+# Parquet/dataset cache HF downloads to.
+indexer/python/.cache/
+# Python venv (~2 GB with torch/cuda).
+indexer/python/.venv/
+__pycache__/
+*.pyc
+
+# ─── Test/coverage ──────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+
+# ─── OS / editor ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# ─── Misc ───────────────────────────────────────────────────────────────────
+*.log
+tmp/
+.tmp/
+# Claude Code per-session metadata (transcripts, memory) — per-developer.
+.claude/
+
+CLAUDE.md

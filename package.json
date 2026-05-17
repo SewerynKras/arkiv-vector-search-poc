@@ -1,0 +1,31 @@
+{
+  "name": "arkiv-search-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "shared",
+    "indexer",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "fetch": "pnpm --filter @arkiv-search/indexer run fetch",
+    "chunk": "pnpm --filter @arkiv-search/indexer run chunk",
+    "embed": "pnpm --filter @arkiv-search/indexer run embed",
+    "centroids": "pnpm --filter @arkiv-search/indexer run centroids",
+    "assign": "pnpm --filter @arkiv-search/indexer run assign",
+    "eval": "pnpm --filter @arkiv-search/indexer run eval",
+    "arkiv:subset": "pnpm --filter @arkiv-search/indexer run arkiv:subset",
+    "publish:sqlite": "pnpm --filter @arkiv-search/server run publish",
+    "publish:arkiv": "pnpm --filter @arkiv-search/server run publish:arkiv",
+    "cleanup:arkiv": "pnpm --filter @arkiv-search/server run cleanup:arkiv",
+    "server": "pnpm --filter @arkiv-search/server run dev",
+    "search": "pnpm --filter @arkiv-search/server run search",
+    "eval:api": "pnpm --filter @arkiv-search/server run eval"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
