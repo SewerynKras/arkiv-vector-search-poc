@@ -18,12 +18,11 @@
     "assign": "pnpm --filter @arkiv-search/indexer run assign",
     "eval": "pnpm --filter @arkiv-search/indexer run eval",
     "arkiv:subset": "pnpm --filter @arkiv-search/indexer run arkiv:subset",
-    "publish:sqlite": "pnpm --filter @arkiv-search/server run publish",
     "publish:arkiv": "pnpm --filter @arkiv-search/server run publish:arkiv",
     "cleanup:arkiv": "pnpm --filter @arkiv-search/server run cleanup:arkiv",
-    "server": "pnpm --filter @arkiv-search/server run dev",
-    "search": "pnpm --filter @arkiv-search/server run search",
-    "eval:api": "pnpm --filter @arkiv-search/server run eval"
+    "update-manifest": "pnpm --filter @arkiv-search/server run update-manifest",
+    "smoke:arkiv": "pnpm --filter @arkiv-search/server run smoke:arkiv",
+    "dev": "pnpm --filter @arkiv-search/client run dev"
   },
   "engines": {
     "node": ">=20"
