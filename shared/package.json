@@ -1,0 +1,26 @@
+{
+  "name": "@arkiv-search/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./embedding": "./src/embedding.ts",
+    "./quantize": "./src/quantize.ts",
+    "./ivf": "./src/ivf.ts",
+    "./schema": "./src/schema.ts",
+    "./api-client": "./src/api-client.ts",
+    "./search": "./src/search.ts",
+    "./arkiv": "./src/arkiv.ts",
+    "./arkiv-rpc-client": "./src/arkiv-rpc-client.ts",
+    "./pca": "./src/pca.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "@msgpack/msgpack": "^3.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
