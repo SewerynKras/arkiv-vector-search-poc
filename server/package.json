@@ -1,0 +1,22 @@
+{
+  "name": "@arkiv-search/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "publish:arkiv": "tsx --env-file=../.env src/publish-arkiv.ts",
+    "cleanup:arkiv": "tsx --env-file=../.env src/cleanup-arkiv-dupes.ts",
+    "update-manifest": "tsx --env-file=../.env src/update-manifest.ts",
+    "smoke:arkiv": "tsx --env-file=../.env src/smoke-arkiv.ts"
+  },
+  "dependencies": {
+    "@arkiv-network/sdk": "^0.6.8",
+    "@arkiv-search/shared": "workspace:*",
+    "@msgpack/msgpack": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
