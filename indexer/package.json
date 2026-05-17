@@ -1,0 +1,27 @@
+{
+  "name": "@arkiv-search/indexer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch": "tsx src/01-fetch-dataset.ts",
+    "chunk": "tsx src/02-chunk.ts",
+    "embed": "tsx src/03-embed.ts",
+    "centroids": "tsx src/04-train-centroids.ts",
+    "assign": "tsx src/05-assign-cells.ts",
+    "eval": "tsx src/eval-recall.ts",
+    "arkiv:subset": "tsx src/build-arkiv-subset.ts"
+  },
+  "dependencies": {
+    "@arkiv-network/sdk": "^0.6.8",
+    "@arkiv-search/shared": "workspace:*",
+    "@huggingface/transformers": "^3.0.0",
+    "@msgpack/msgpack": "^3.0.0",
+    "faiss-node": "^0.5.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
