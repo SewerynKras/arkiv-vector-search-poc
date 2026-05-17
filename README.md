@@ -26,6 +26,16 @@ pnpm dev
 First load downloads the bge-small ONNX model (~33 MB) and 2 048 centroid
 entities from Arkiv (~3 s on a fast connection);
 
+## What's IVF?
+
+**Inverted-file index.** Partition the embedding space into `C` clusters
+via k-means, then file each chunk under the few clusters it sits closest
+to. A query scores its vector against the `C` cluster centres, picks the
+top `nprobe`, and only reranks the chunks filed there — so we avoid
+brute-forcing all 96 k embeddings. The on-chain query is one OR over `nprobe
+× M` equality predicates, which is exactly the shape Arkiv's DSL handles
+well.
+
 ## Indexer pipeline
 
 Each step writes to `indexer/data/` and is independently re-runnable. Run
