@@ -1,4 +1,8 @@
-import { pipeline, type FeatureExtractionPipeline } from '@huggingface/transformers';
+import { env, pipeline, type FeatureExtractionPipeline } from '@huggingface/transformers';
+
+// Re-export so callers configure the singleton through the same module
+// they're using to embed — no second direct dep on transformers needed.
+export { env };
 
 export const MODEL_ID = 'Xenova/bge-small-en-v1.5';
 export const MODEL_DTYPE = 'q8' as const;

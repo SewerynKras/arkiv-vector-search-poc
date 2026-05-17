@@ -5,6 +5,11 @@
 // centroid set. Translates streaming bootstrap events from `shared/search.ts`
 // into a per-step state slice the right column can render directly.
 
+// Configure transformers.js to load model files from our static bundle
+// instead of HF (CORS-blocked in production). Side-effect import — must run
+// before any getEmbedder() call.
+import "@/lib/configure-transformers";
+
 import { useEffect, useMemo, useReducer, useRef } from "react";
 
 import type { ApiClient } from "@arkiv-search/shared/api-client";
