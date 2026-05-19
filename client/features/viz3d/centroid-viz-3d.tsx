@@ -58,9 +58,10 @@ export function CentroidViz3DCanvas({
     // `transfer` would neuter the original on this side, breaking other
     // consumers of the same buffer (e.g., centroid scoring at query time).
     const copy = centroids.slice();
-    const worker = new Worker(new URL("./pca-worker.ts", import.meta.url), {
-      type: "module",
-    });
+    // Worker source lives in public/ as plain JS so Next's static export
+    // publishes it verbatim — bundling `new Worker(new URL(...))` doesn't
+    // work with `output: "export"`.
+    const worker = new Worker("/pca-worker.js");
     const t0 = performance.now();
     worker.onmessage = (ev: MessageEvent<PcaResult>) => {
       console.log(
