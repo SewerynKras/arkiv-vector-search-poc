@@ -12,6 +12,8 @@ const nextConfig = {
   // files (and their .js import extensions, written for NodeNext) get
   // resolved correctly.
   transpilePackages: ['@arkiv-search/shared'],
+
+  reactCompiler: true
 };
 
 export default nextConfig;

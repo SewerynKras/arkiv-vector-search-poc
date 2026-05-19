@@ -1,9 +1,8 @@
-// Shared types + decoders for both the Arkiv-RPC client (live, Braga) and
-// any other ApiClient implementations. The concrete client implementation
-// lives in arkiv-rpc-client.ts.
+// Shared types + decoders for any ApiClient implementation (concrete one
+// lives in arkiv-rpc-client.ts).
 
 import { decode as msgpackDecode } from '@msgpack/msgpack';
-import type { ChunkPayload, Manifest } from './schema';
+import type { ChunkBucketPayload, ChunkMini, Manifest } from './schema';
 
 export interface EntityResponse {
   key: string;
@@ -42,19 +41,31 @@ export function decodeManifest(e: EntityResponse): Manifest {
   return JSON.parse(new TextDecoder().decode(decodePayload(e.payload))) as Manifest;
 }
 
-export function decodeChunk(e: EntityResponse): ChunkPayload {
-  const raw = msgpackDecode(decodePayload(e.payload)) as ChunkPayload;
-  // msgpack returns Buffer for binary; coerce to Uint8Array.
-  return {
-    ...raw,
-    emb: new Uint8Array(raw.emb.buffer, raw.emb.byteOffset, raw.emb.byteLength),
-  };
+// Decode a chunk_bucket entity into the chunk minis it carries. The
+// embeddings come back as fresh Uint8Array views (msgpack hands back
+// Buffer-flavored Uint8Arrays which we re-wrap for cleanliness).
+export function decodeChunkBucket(e: EntityResponse): ChunkMini[] {
+  const raw = msgpackDecode(decodePayload(e.payload)) as ChunkBucketPayload;
+  return raw.chunks.map((c) => ({
+    cid: c.cid,
+    pid: c.pid,
+    url: c.url,
+    emb: new Uint8Array(c.emb.buffer, c.emb.byteOffset, c.emb.byteLength),
+  }));
 }
 
-export function decodeCentroidPayload(e: EntityResponse, dim: number): Float32Array {
+// Decode a centroid bucket payload into a flat Float32Array of one or more
+// centroids. Each centroid is `dim` floats; the entity packs K of them
+// (~80 for d=384 to stay under the 128 KB ceiling). The caller reads
+// `first_cell_id` from the entity's numeric attributes to know where to
+// place this batch in the flat C*dim buffer.
+export function decodeCentroidBatch(e: EntityResponse, dim: number): Float32Array {
   const bytes = decodePayload(e.payload);
-  if (bytes.byteLength !== dim * 4) {
-    throw new Error(`centroid payload size ${bytes.byteLength} != ${dim * 4}`);
+  const bytesPerVec = dim * 4;
+  if (bytes.byteLength === 0 || bytes.byteLength % bytesPerVec !== 0) {
+    throw new Error(
+      `centroid payload size ${bytes.byteLength} not a positive multiple of ${bytesPerVec}`,
+    );
   }
   // Copy into an aligned buffer.
   const ab = new ArrayBuffer(bytes.byteLength);
@@ -67,11 +78,11 @@ export function dslString(s: string): string {
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
-// Build the IVF disjunction predicate over cell_id_0..cell_id_{M-1}.
-export function buildIvfPredicate(probedCells: number[], M: number): string {
-  const terms: string[] = [];
-  for (let m = 0; m < M; m++) {
-    for (const c of probedCells) terms.push(`cell_id_${m} = ${c}`);
-  }
-  return `(${terms.join(' || ')})`;
+// Build the IVF disjunction predicate over `cell_id`. In v2 each chunk's
+// multi-assignment is realized by storing it in M buckets (one per assigned
+// cell), so the query is a flat OR over a single attribute — no _0/_1/_2
+// fan-out, no M-multiplier on the term count.
+export function buildIvfPredicate(probedCells: number[]): string {
+  if (probedCells.length === 0) return '(cell_id < 0)'; // matches nothing
+  return `(${probedCells.map((c) => `cell_id = ${c}`).join(' || ')})`;
 }

@@ -1,16 +1,16 @@
-// Find and delete duplicate centroid entities on Braga.
+// Find and delete duplicate entities on Braga.
 //
-//   pnpm run cleanup:arkiv                # plan + ask for confirm (dry-run by default)
-//   CONFIRM=1 pnpm run cleanup:arkiv      # actually delete
-//   KIND=chunk pnpm run cleanup:arkiv     # other entity kinds (centroid|chunk|manifest)
+//   pnpm run cleanup:arkiv                       # plan + ask for confirm (dry-run by default)
+//   CONFIRM=1 pnpm run cleanup:arkiv             # actually delete
+//   KIND=chunk_bucket pnpm run cleanup:arkiv     # other entity kinds (centroid|chunk_bucket|manifest)
 //
 // Re-publishing the index without first cleaning up leaves duplicate
-// entities on chain for the same cell_id / chunk_index. The bootstrap's
-// strict count check then trips because it sees more entities than the
-// manifest's C. This script:
+// entities on chain for the same (cell_id, bucket_index) / batch_id. The
+// bootstrap's strict count check then trips because it sees more entities
+// than the manifest's C. This script:
 //   1. Pages through all entities of the chosen kind under our scope.
-//   2. Groups them by their unique key (cell_id for centroids, chunk_index
-//      for chunks).
+//   2. Groups them by their unique key: `batch_id` for centroid buckets,
+//      (cell_id, bucket_index) for chunk buckets, collapsed for manifests.
 //   3. For groups with >1 entity, keeps the oldest (lowest createdAtBlock)
 //      and queues the rest for deletion.
 //   4. Submits deletes via mutateEntities in batches.
@@ -23,35 +23,45 @@ import { createArkivClient } from "@arkiv-search/shared/arkiv-rpc-client";
 import { scopeClause } from "@arkiv-search/shared/arkiv";
 import { MODEL_ID } from "@arkiv-search/shared/embedding";
 
-const KIND = (process.env.KIND ?? "centroid") as "centroid" | "chunk" | "manifest";
-const CENTROID_SET_ID = process.env.CENTROID_SET_ID ?? "ivf-v1";
+const KIND = (process.env.KIND ?? "centroid") as
+  | "centroid"
+  | "chunk_bucket"
+  | "manifest";
+const CENTROID_SET_ID = process.env.CENTROID_SET_ID ?? "ivf-v2";
 const CONFIRM = process.env.CONFIRM === "1";
 const DELETE_BATCH = Number(process.env.DELETE_BATCH ?? 50);
+// pageSize=200 with v2 entities returns up to ~6 MB hex-encoded payload per
+// page (200 × ~120 KB centroid buckets × 2x hex inflation), which blows the
+// Arkiv RPC response cap. Smaller pages are slower to paginate but always
+// fit. Override with FETCH_PAGE_SIZE if you know the target entity kind
+// has small payloads (e.g., manifests).
+const FETCH_PAGE_SIZE = Number(process.env.FETCH_PAGE_SIZE ?? 16);
 
 // Per-kind: which numeric attribute makes an entity "unique" within its set.
 // Manifests have no key attribute (we keep one); we'd delete extra by
 // createdAtBlock order if multiple exist.
+//
+// Centroid buckets carry `batch_id` (sequence 0..ceil(C/K)). Chunk buckets
+// carry (cell_id, bucket_index) — we synthesize a compound key for those.
 const UNIQUE_ATTR: Record<typeof KIND, string | null> = {
-  centroid: "cell_id",
-  chunk: "chunk_index",
+  centroid: process.env.UNIQUE_ATTR ?? "batch_id",
+  chunk_bucket: null, // synthesized below
   manifest: null,
 };
 
 async function main() {
-  if (!CONFIRM && process.env.PRIVATE_KEY === undefined) {
-    // Dry-run path doesn't need keys; we only need a key to actually delete.
-  }
-
   const api = createArkivClient();
   const uniqueAttr = UNIQUE_ATTR[KIND];
 
-  // Build the scoped query. Manifest queries don't have a centroid_set_id
-  // filter — we want to find all manifests if cleaning manifests.
-  const setFilter =
-    KIND === "manifest" ? "" : ` && centroid_set_id = "${CENTROID_SET_ID}"`;
-  const q = `kind = "${KIND}" && model_id = "${MODEL_ID}"${setFilter} && ${scopeClause()}`;
+  // Always scope by centroid_set_id, including for KIND=manifest. Earlier
+  // versions of this script intentionally dropped that filter for manifests
+  // ("find all manifests across sets"); that collapsed manifests from
+  // different centroid sets into one dedup group and made it trivially
+  // possible to nuke a still-needed manifest from another set. Don't do
+  // that. If you want a cross-set sweep, run this once per set_id.
+  const q = `kind = "${KIND}" && model_id = "${MODEL_ID}" && centroid_set_id = "${CENTROID_SET_ID}" && ${scopeClause()}`;
 
-  console.log(`Cleanup target: kind=${KIND}${KIND !== "manifest" ? `, centroid_set_id=${CENTROID_SET_ID}` : ""}`);
+  console.log(`Cleanup target: kind=${KIND}, centroid_set_id=${CENTROID_SET_ID}`);
   console.log(`Mode:           ${CONFIRM ? "DELETE" : "dry-run"} (set CONFIRM=1 to actually delete)`);
   console.log(`Query:          ${q}`);
   console.log();
@@ -63,12 +73,17 @@ async function main() {
   let pageToken: string | null = null;
   let pageIdx = 0;
   while (true) {
-    const page = await api.queryPage(q, 200, pageToken);
+    const page = await api.queryPage(q, FETCH_PAGE_SIZE, pageToken);
     for (const e of page.entities) {
-      const uniqueVal =
-        uniqueAttr === null
-          ? "manifest" // collapse all manifests into one group
-          : String(e.numericAttributes[uniqueAttr]);
+      let uniqueVal: string;
+      if (KIND === "chunk_bucket") {
+        // Chunk buckets are unique per (cell_id, bucket_index) pair.
+        uniqueVal = `${e.numericAttributes["cell_id"]}:${e.numericAttributes["bucket_index"]}`;
+      } else if (uniqueAttr === null) {
+        uniqueVal = KIND; // collapse all manifests into one group
+      } else {
+        uniqueVal = String(e.numericAttributes[uniqueAttr]);
+      }
       all.push({
         key: e.key,
         uniqueKey: uniqueVal,

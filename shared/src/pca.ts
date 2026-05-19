@@ -7,7 +7,8 @@
 //   mean:       D     — mean used to center X
 //   variance:   K     — per-component variance (eigenvalue, descending)
 //
-// At N=2048, D=384, K=3 this runs in a few tens of ms.
+// At N=2048, D=384, K=3 this runs in ~300 ms in pure JS V8 — long enough
+// that the client runs it in a Web Worker (see viz3d/pca-worker.ts).
 
 export interface PcaResult {
   components: Float32Array; // K * D

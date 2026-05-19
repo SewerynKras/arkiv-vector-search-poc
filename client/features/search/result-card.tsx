@@ -1,10 +1,15 @@
-// One article in the results list. Google-SERP layout: small rank/score
-// caption, URL crumb, title (link), then stacked snippet rows with their
-// individual int8 scores, cell tags, and an Arkiv-data-viewer link per chunk.
+// One article in the results list. Layout: small rank/score caption, URL
+// crumb, title (link), Wikipedia extract paragraph, and an Arkiv link to
+// the bucket the chunk came from.
+//
+// Chunk text and title are no longer stored on chain (v2 schema) — we
+// fetch them from the Wikipedia REST summary API at render time. The
+// fetch is cached across renders/queries by URL.
 
 import type { SearchResultGroup } from "@arkiv-search/shared/search";
 
 import { arkivEntityUrl, shortKey } from "@/features/arkiv/links";
+import { useWikiSummary } from "@/features/wiki/use-wiki-summaries";
 
 export function ResultCard({
   group,
@@ -15,8 +20,11 @@ export function ResultCard({
   rank: number;
   delay?: number;
 }) {
-  const head = group.chunks[0]!;
-  const hidden = group.totalInGroup - group.chunks.length;
+  const summary = useWikiSummary(group.url);
+  const top = group.topResult;
+  const bucketLink = arkivEntityUrl(top.bucketKey);
+  const displayTitle = summary?.title ?? prettifyTitleFromUrl(group.url);
+
   return (
     <article
       className="duration-200 ease-out animate-in fade-in slide-in-from-bottom-1"
@@ -25,8 +33,13 @@ export function ResultCard({
       <div className="mb-1 font-mono text-[11px] text-muted-foreground">
         #{rank}{" "}
         <span className="ml-1.5 font-semibold text-primary">
-          {head.score.toFixed(3)}
+          {group.bestScore.toFixed(3)}
         </span>
+        {group.hits > 1 && (
+          <span className="ml-2 text-muted-foreground">
+            {group.hits} passages
+          </span>
+        )}
       </div>
       <div className="mb-0.5 break-all text-[12.5px] text-muted-foreground">
         <a
@@ -45,68 +58,67 @@ export function ResultCard({
           rel="noopener"
           className="text-primary hover:underline"
         >
-          {group.title}
+          {displayTitle}
         </a>
       </h4>
-      <div className="space-y-2.5">
-        {group.chunks.map((c, i) => (
+      {/* Reserve ~3 lines (text-[14px] × leading-relaxed ≈ 22px each) so
+       *  cards don't jump as Wikipedia extracts stream in at varying
+       *  lengths. */}
+      <div className="min-h-[66px]">
+        {summary?.extract ? (
+          <p className="text-[14px] leading-relaxed text-foreground/80">
+            {summary.extract}
+          </p>
+        ) : summary === undefined ? (
           <div
-            key={c.key}
-            className="grid grid-cols-[48px_1fr] gap-2.5 data-[first=false]:border-t data-[first=false]:border-dashed data-[first=false]:border-border data-[first=false]:pt-2.5"
-            data-first={i === 0}
+            className="space-y-2"
+            role="status"
+            aria-label="Loading article extract"
           >
-            <div className="pt-0.5 font-mono text-[11px] text-muted-foreground">
-              {c.score.toFixed(3)}
-            </div>
-            <div>
-              <p className="text-[14px] leading-relaxed text-foreground/80">
-                {c.text}
-              </p>
-              <ChunkTags cellIds={c.cellIds} chunkKey={c.key} />
-            </div>
+            <div className="h-3.5 w-full animate-pulse rounded-sm bg-muted/60" />
+            <div className="h-3.5 w-11/12 animate-pulse rounded-sm bg-muted/60" />
+            <div className="h-3.5 w-3/4 animate-pulse rounded-sm bg-muted/60" />
           </div>
-        ))}
+        ) : (
+          <p className="text-[13px] italic text-muted-foreground">
+            No extract available.
+          </p>
+        )}
       </div>
-      {hidden > 0 && (
-        <div className="mt-2.5 font-mono text-[11px] italic text-muted-foreground">
-          + {hidden} more passage{hidden === 1 ? "" : "s"} from this article in
-          the candidate set
-        </div>
-      )}
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {top.cellIds
+          .filter((c) => c >= 0)
+          .map((c) => (
+            <span
+              key={c}
+              className="rounded-sm border border-border px-1.5 py-0 font-mono text-[10px] text-muted-foreground"
+            >
+              cell {c}
+            </span>
+          ))}
+        {bucketLink && (
+          <a
+            href={bucketLink}
+            target="_blank"
+            rel="noopener"
+            className="rounded-sm border border-border px-1.5 py-0 font-mono text-[10px] text-primary hover:border-primary hover:underline"
+            title={top.bucketKey}
+          >
+            view bucket on Arkiv ↗ · {shortKey(top.bucketKey)}
+          </a>
+        )}
+      </div>
     </article>
   );
 }
 
-function ChunkTags({
-  cellIds,
-  chunkKey,
-}: {
-  cellIds: number[];
-  chunkKey: string;
-}) {
-  const tags = cellIds.filter((x) => x >= 0);
-  const link = arkivEntityUrl(chunkKey);
-  return (
-    <div className="mt-1.5 flex flex-wrap gap-1.5">
-      {tags.map((c) => (
-        <span
-          key={c}
-          className="rounded-sm border border-border px-1.5 py-0 font-mono text-[10px] text-muted-foreground"
-        >
-          cell {c}
-        </span>
-      ))}
-      {link && (
-        <a
-          href={link}
-          target="_blank"
-          rel="noopener"
-          className="rounded-sm border border-border px-1.5 py-0 font-mono text-[10px] text-primary hover:border-primary hover:underline"
-          title={chunkKey}
-        >
-          view on Arkiv ↗ · {shortKey(chunkKey)}
-        </a>
-      )}
-    </div>
-  );
+function prettifyTitleFromUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/^\/wiki\/(.+)$/);
+    if (!m) return url;
+    return decodeURIComponent(m[1]!).replace(/_/g, " ");
+  } catch {
+    return url;
+  }
 }

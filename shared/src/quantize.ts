@@ -1,52 +1,32 @@
-// Per-vector INT8 quantization.
+// Vector quantization for chunk embeddings.
 //
-// scale = max(abs(v)) / 127
-// q[i]  = round(v[i] / scale) clamped to [-127, 127]
+// Active scheme is **turboquant-wasm** (Zig → WASM + relaxed SIMD), wrapping
+// Google's TurboQuant algorithm. We pass the WASM engine straight through to
+// callers — see `shared/src/search.ts` for the bootstrap-time init and
+// `server/src/publish-arkiv.ts` for the per-vector `encode()` loop.
 //
-// Wire format: 4-byte little-endian float32 scale, then `dim` int8 values.
-// Total = 4 + dim bytes (388 for dim=384).
+// One wrinkle: TurboQuant.init requires `dim` to be a power of 2; bge-small
+// is 384-dim (= 1.5 × 2^8). We pad to the next power of 2 (512) at encode
+// and at query time. Dot products are unaffected by zero-tail padding, so
+// scoring stays correct.
 
-export function quantizeInt8(v: Float32Array): Uint8Array {
-  const dim = v.length;
-  let maxAbs = 0;
-  for (let i = 0; i < dim; i++) {
-    const a = Math.abs(v[i]!);
-    if (a > maxAbs) maxAbs = a;
-  }
-  const scale = maxAbs === 0 ? 1 : maxAbs / 127;
-  const buf = new ArrayBuffer(4 + dim);
-  new DataView(buf).setFloat32(0, scale, true);
-  const q = new Int8Array(buf, 4, dim);
-  for (let i = 0; i < dim; i++) {
-    let x = Math.round(v[i]! / scale);
-    if (x > 127) x = 127;
-    else if (x < -127) x = -127;
-    q[i] = x;
-  }
-  return new Uint8Array(buf);
+export { TurboQuant } from "turboquant-wasm";
+export type { TurboQuantConfig } from "turboquant-wasm";
+
+// Smallest power of 2 ≥ n. We choose `tqDim = nextPow2(modelDim)` once at
+// publish time and write it into the manifest so the client matches.
+export function nextPow2(n: number): number {
+  if (n <= 1) return 1;
+  return 1 << Math.ceil(Math.log2(n));
 }
 
-export function dequantizeInt8(packed: Uint8Array): Float32Array {
-  const dim = packed.byteLength - 4;
-  const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-  const scale = view.getFloat32(0, true);
-  const q = new Int8Array(packed.buffer, packed.byteOffset + 4, dim);
-  const out = new Float32Array(dim);
-  for (let i = 0; i < dim; i++) out[i] = q[i]! * scale;
+// Return `v` zero-padded to length `tqDim`. If lengths already match the
+// input is returned as-is to avoid allocation.
+export function padToTqDim(v: Float32Array, tqDim: number): Float32Array {
+  if (v.length === tqDim) return v;
+  if (v.length > tqDim)
+    throw new Error(`padToTqDim: input length ${v.length} > tqDim ${tqDim}`);
+  const out = new Float32Array(tqDim);
+  out.set(v);
   return out;
-}
-
-// dot(query, dequantize(packed)) without materializing a float copy.
-// Hot path for reranking.
-export function dotPackedInt8(query: Float32Array, packed: Uint8Array): number {
-  const dim = packed.byteLength - 4;
-  if (query.length !== dim) {
-    throw new Error(`dim mismatch: query=${query.length} packed_dim=${dim}`);
-  }
-  const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-  const scale = view.getFloat32(0, true);
-  const q = new Int8Array(packed.buffer, packed.byteOffset + 4, dim);
-  let s = 0;
-  for (let i = 0; i < dim; i++) s += query[i]! * q[i]!;
-  return s * scale;
 }

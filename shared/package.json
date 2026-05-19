@@ -18,7 +18,8 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
-    "@msgpack/msgpack": "^3.0.0"
+    "@msgpack/msgpack": "^3.0.0",
+    "turboquant-wasm": "^0.4.1"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

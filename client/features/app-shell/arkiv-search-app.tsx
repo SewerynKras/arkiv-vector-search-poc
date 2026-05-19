@@ -24,9 +24,10 @@ export function ArkivSearchApp() {
     api: bootstrap.api,
     manifest: bootstrap.manifest.manifest,
     centroids: bootstrap.centroids.centroids,
+    tq: bootstrap.quantizer.tq,
   })
   const [k, setK] = useState(10)
-  const [nprobe, setNprobe] = useState(8)
+  const [nprobe, setNprobe] = useState(16)
   const barRef = useRef<SearchBarHandle>(null)
 
   // Imperative handle to the 3D viz. Search-event side effects drive it

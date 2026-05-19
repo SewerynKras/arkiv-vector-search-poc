@@ -23,8 +23,13 @@ pnpm install
 pnpm dev
 ```
 
-First load downloads the bge-small ONNX model (~33 MB) and 2 048 centroid
-entities from Arkiv (~3 s on a fast connection);
+On a cold first load the client fetches:
+
+- the bge-small ONNX model from R2 (~33 MB; cached by the browser),
+- the manifest entity,
+- ~26 packed centroid-bucket entities from Arkiv (`ivf-v2`, K=80 centroids per
+  entity; cached in IndexedDB by `centroid_set_hash`),
+- the turboquant-wasm engine (embedded in the JS bundle).
 
 ## What's IVF?
 
@@ -32,9 +37,37 @@ entities from Arkiv (~3 s on a fast connection);
 via k-means, then file each chunk under the few clusters it sits closest
 to. A query scores its vector against the `C` cluster centres, picks the
 top `nprobe`, and only reranks the chunks filed there — so we avoid
-brute-forcing all 96 k embeddings. The on-chain query is one OR over `nprobe
-× M` equality predicates, which is exactly the shape Arkiv's DSL handles
-well.
+brute-forcing all 96 k embeddings.
+
+The on-chain query is a flat OR over `nprobe` equalities on a
+single `cell_id` attribute, AND-ed with the project / protocol /
+`$creator` scope. Multi-assignment is realised by storing each chunk in
+M=3 chunk-bucket entities (one per assigned cell), so the query stays
+simple.
+
+## v2 architecture
+
+The index is *bucketed* on chain to keep RPC round-trips down at scale:
+
+- **Manifest** (1 entity) — small JSON record: `N_chunks`, `C`, `M`,
+  `nprobe_default`, model SHA, centroid-set hash, and the TurboQuant
+  config (`tq_dim`, `tq_seed`, `emb_byte_size`).
+- **Centroid buckets** (~`C/80` entities, `kind="centroid"`) — each entity
+  packs K=80 float32 centroids, attribute `first_cell_id` tells the
+  client where the batch lands. At C=2048 this is 26 entities.
+- **Chunk buckets** (~thousands, `kind="chunk_bucket"`) — each entity
+  carries many chunks (msgpacked) that all belong to the same cell. Each
+  chunk is `{ cid, emb, pid, url }`; no raw text. Title and extract are
+  fetched from the public Wikipedia REST summary API at result-display
+  time.
+
+Chunk embeddings use **turboquant-wasm** (Google's TurboQuant algorithm,
+Zig → WASM + relaxed SIMD): ~3 bits/dim → ~320 B per vector at d=384
+(zero-padded to d=512, since the WASM kernel requires a power of 2). The
+rotation matrix is reconstructed deterministically on both publisher and
+client from `tq_seed` — nothing rotation-related is shipped on chain.
+Rerank uses `tq.dotBatch()` for one WASM/WebGPU call over the whole
+candidate set, instead of per-chunk JS↔WASM crossings.
 
 ## Indexer pipeline
 
@@ -111,31 +144,33 @@ Sanity check before publishing: 100 random chunks as queries, IVF top-10
 gate publishing on recall@10 ≥ 0.90.
 
 ```
-NPROBE=8 QUERIES=100 pnpm eval
+NPROBE=16 QUERIES=100 pnpm eval
 ```
 
 ### 7. Publish to Arkiv — `pnpm publish:arkiv`
 
-Writes the manifest entity (1), centroid entities (C), and chunk entities
-(N) to Braga via `mutateEntities` in batches. Reads the indexer wallet's
-`PRIVATE_KEY` from project-root `.env`. ~30 min wall-clock for a 96 k-chunk
-index on the default batch size.
+Encodes every chunk through TurboQuant, buckets chunks by cell, then writes
+manifest + centroid buckets + chunk buckets to Braga via `mutateEntities`.
+Reads the indexer wallet's `PRIVATE_KEY` from project-root `.env`. The
+publisher uses byte-budget batching (default 180 KB raw payload per tx)
+and sorts chunk buckets by size so small ones pack densely and large ones
+ship solo.
 
 ```
-pnpm publish:arkiv                              # full corpus
-DRY_RUN=1 pnpm publish:arkiv                    # print plan, no tx
-PHASES=manifest,centroids,chunks pnpm publish:arkiv   # subset of phases (recover from a partial run)
-START_INDEX=50000 PHASES=chunks pnpm publish:arkiv    # resume mid-flight
+pnpm publish:arkiv                                  # full corpus
+DRY_RUN=1 pnpm publish:arkiv                        # print plan, no tx
+PHASES=manifest,centroids,chunks pnpm publish:arkiv # subset of phases (recover from a partial run)
+START_INDEX=1500 PHASES=chunks pnpm publish:arkiv   # resume mid-flight
+TX_BYTE_BUDGET=131072 pnpm publish:arkiv            # tighten the per-tx byte budget
 ```
 
 ## Maintenance scripts
 
-| Command                | Purpose                                                                                                                                             |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm cleanup:arkiv`   | Find duplicate entities under our scope, keep the oldest, delete the rest. Required if a publish run is repeated. `KIND=centroid\|chunk\|manifest`. |
-| `pnpm update-manifest` | Patch fields on the existing manifest entity in place (e.g. `nprobe_default`). Dry-run by default; pass `CONFIRM=1` to apply.                       |
-| `pnpm smoke:arkiv`     | Smoke-test bootstrap: fetch manifest, verify centroid hash, decode a chunk.                                                                         |
-
+| Command                | Purpose                                                                                                                                                                      |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm cleanup:arkiv`   | Find duplicate entities under our scope (always scoped by `centroid_set_id`), keep the oldest, delete the rest. `KIND=centroid\|chunk_bucket\|manifest`. Dry-run by default. |
+| `pnpm update-manifest` | Patch `nprobe_default` on the existing manifest entity in place. Dry-run by default; pass `CONFIRM=1` to apply.                                                              |
+| `pnpm smoke:arkiv`     | Bootstrap from Arkiv (manifest + centroids + TurboQuant init), run one search, print the top articles. No browser needed.                                                    |
 
 ## Configuration
 
@@ -148,5 +183,5 @@ PRIVATE_KEY=0x…   # indexer wallet on Braga; only the publish/cleanup/update s
 `client/.env.local` exposes one optional knob:
 
 ```
-NEXT_PUBLIC_CENTROID_SET_ID=ivf-v1   # point the browser at a different IVF set
+NEXT_PUBLIC_CENTROID_SET_ID=ivf-v2   # point the browser at a different IVF set
 ```

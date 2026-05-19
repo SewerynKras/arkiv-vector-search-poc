@@ -1,13 +1,10 @@
-// Update the on-chain manifest entity in place. The original `nprobe_default`
-// (256, derived from C/8) is too high for our 200/page × 10-page Arkiv
-// candidate cap — at 768 OR-terms we pull 2000 entities by pagination order
-// rather than score, so the most relevant chunks get truncated. Lowering it
-// to 8 gives much better practical recall.
+// Patch `nprobe_default` on the on-chain manifest entity in place. Useful
+// after eval-recall lands on a new sweet spot without wanting to republish
+// the whole index.
 //
 // Usage:
-//   pnpm run update-manifest                  # dry-run (prints diff)
-//   CONFIRM=1 pnpm run update-manifest        # actually update on-chain
-//   NPROBE_DEFAULT=12 CONFIRM=1 pnpm run …    # override the new value
+//   pnpm run update-manifest                              # dry-run (prints diff)
+//   NPROBE_DEFAULT=16 CONFIRM=1 pnpm run update-manifest  # actually update
 //
 // Reads PRIVATE_KEY from project-root .env via the package script.
 
@@ -26,7 +23,7 @@ import { createArkivClient } from "@arkiv-search/shared/arkiv-rpc-client";
 import { MODEL_ID } from "@arkiv-search/shared/embedding";
 import type { Manifest } from "@arkiv-search/shared/schema";
 
-const CENTROID_SET_ID = process.env.CENTROID_SET_ID ?? "ivf-v1";
+const CENTROID_SET_ID = process.env.CENTROID_SET_ID ?? "ivf-v2";
 const NEW_NPROBE_DEFAULT = Number(process.env.NPROBE_DEFAULT ?? 8);
 const EXP_DAYS = Number(process.env.EXP_DAYS ?? DEFAULT_EXPIRATION_DAYS);
 const CONFIRM = process.env.CONFIRM === "1";

@@ -3,8 +3,14 @@
 // React wrapper around the imperative three.js viz module. Mounts/unmounts a
 // canvas, exposes the underlying instance via a ref so the parent search
 // hook can drive paintScores/markProbed/markHits/reset.
+//
+// PCA is run in a Web Worker so the ~300 ms power-iteration pass doesn't
+// freeze the main thread while the bootstrap finalises. We render a small
+// "computing 3D map…" placeholder until the worker reports back.
 
-import { useEffect, useRef, type Ref } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
+
+import type { PcaResult } from "@arkiv-search/shared/pca";
 
 import {
   createCentroidViz3D,
@@ -22,10 +28,6 @@ export interface CentroidViz3DCanvasProps {
   className?: string;
 }
 
-/** Apply a callback / object ref to a value, mimicking React's own ref
- * forwarding. We do this manually because useImperativeHandle runs at
- * render time — before the post-mount effect that creates the viz — so
- * the handle would always be null. */
 function applyRef<T>(ref: Ref<T> | undefined, value: T | null): void {
   if (!ref) return;
   if (typeof ref === "function") {
@@ -44,26 +46,61 @@ export function CentroidViz3DCanvas({
   className,
 }: CentroidViz3DCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [pcaResult, setPcaResult] = useState<PcaResult | null>(null);
 
+  // Run PCA in a Web Worker so the main thread keeps repainting. The worker
+  // postMessages the result back as transferable buffers — no copy on the
+  // main side. We reset to null whenever the source centroids change so a
+  // stale projection never gets paired with a fresh dataset.
   useEffect(() => {
-    if (!containerRef.current) return;
+    setPcaResult(null);
+    // We pass a copy of `centroids` into the worker because postMessage with
+    // `transfer` would neuter the original on this side, breaking other
+    // consumers of the same buffer (e.g., centroid scoring at query time).
+    const copy = centroids.slice();
+    const worker = new Worker(new URL("./pca-worker.ts", import.meta.url), {
+      type: "module",
+    });
+    const t0 = performance.now();
+    worker.onmessage = (ev: MessageEvent<PcaResult>) => {
+      console.log(
+        `[viz3d] PCA (worker) done in ${(performance.now() - t0).toFixed(0)}ms, variance =`,
+        ev.data.variance.map((v) => v.toFixed(3)),
+      );
+      setPcaResult(ev.data);
+      worker.terminate();
+    };
+    worker.onerror = (e) => {
+      console.error("[viz3d] PCA worker failed:", e);
+      worker.terminate();
+    };
+    worker.postMessage(
+      { centroids: copy, C, dim, K: 3, iters: 60 },
+      { transfer: [copy.buffer] },
+    );
+    return () => worker.terminate();
+  }, [centroids, C, dim]);
+
+  // Mount the three.js scene only once PCA is in hand.
+  useEffect(() => {
+    if (!containerRef.current || !pcaResult) return;
     const viz = createCentroidViz3D({
       container: containerRef.current,
       centroids,
       C,
       dim,
       onSelect,
+      pcaResult,
     });
     applyRef(ref, viz);
     return () => {
       viz.dispose();
       applyRef(ref, null);
     };
-    // centroids / C / dim only change when the index reloads; the onSelect
-    // handler is stable from the parent's perspective. Re-init only when the
-    // dataset itself changes.
+    // onSelect is stable from the parent's perspective; we only re-init when
+    // the dataset or its PCA changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [centroids, C, dim]);
+  }, [centroids, C, dim, pcaResult]);
 
   return (
     <div
@@ -72,6 +109,12 @@ export function CentroidViz3DCanvas({
         className ??
         "relative aspect-square w-full overflow-hidden rounded-sm border border-border bg-card"
       }
-    />
+    >
+      {!pcaResult && (
+        <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground italic">
+          computing 3D projection…
+        </div>
+      )}
+    </div>
   );
 }

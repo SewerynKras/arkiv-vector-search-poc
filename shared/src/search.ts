@@ -1,5 +1,7 @@
 // Search pipeline shared between the Node CLI and the browser client.
-// Embeds locally, scores centroids, paginates the entity API, reranks.
+// Embeds locally, scores centroids in raw float space, fetches chunk
+// buckets for the probed cells, then reranks via TurboQuant.dot against
+// the WASM-quantized embeddings.
 //
 // The optional `onEvent` callback receives discriminated-union events at
 // each stage; the UI (or eval harness) can render them live. Events are
@@ -8,20 +10,20 @@
 
 import { MODEL_ID, embedOne, EMBEDDING_DIM } from "./embedding";
 import { scoreCentroids, topK, l2NormalizeInPlace } from "./ivf";
-import { dotPackedInt8 } from "./quantize";
-import type { Manifest, ChunkPayload } from "./schema";
+import { TurboQuant, padToTqDim } from "./quantize";
+import type { ChunkMini, Manifest } from "./schema";
 
 import {
   type ApiClient,
   buildIvfPredicate,
-  decodeCentroidPayload,
-  decodeChunk,
+  decodeCentroidBatch,
+  decodeChunkBucket,
   decodeManifest,
   dslString,
 } from "./api-client";
 import { scopeClause } from "./arkiv";
 
-export const DEFAULT_CENTROID_SET_ID = "ivf-v1";
+export const DEFAULT_CENTROID_SET_ID = "ivf-v2";
 
 export interface BootstrapEvents {
   onManifestStart?: () => void | Promise<void>;
@@ -33,31 +35,50 @@ export interface BootstrapEvents {
     expected: number,
   ) => void | Promise<void>;
   onCentroidsDone?: (totalMs: number) => void | Promise<void>;
+  onCentroidsFromCache?: (C: number) => void | Promise<void>;
+  onQuantizerStart?: () => void | Promise<void>;
+  onQuantizerDone?: (ms: number) => void | Promise<void>;
+}
+
+// Pluggable persistent cache for a centroid set. Keyed by a content-derived
+// string so the entry is automatically invalidated when the publisher rolls
+// a new set. The Node CLI doesn't pass one; the browser passes an
+// IndexedDB-backed adapter.
+export interface CentroidCache {
+  get(key: string): Promise<{ centroids: Float32Array; centroidKeys: string[] } | null>;
+  put(key: string, value: { centroids: Float32Array; centroidKeys: string[] }): Promise<void>;
 }
 
 export interface BootstrapResult {
   manifest: Manifest;
-  centroids: Float32Array; // C * dim, indexed by cell_id
-  /** Entity key per cell_id (the chain-assigned hex key on Arkiv, or the
-   * synthetic `centroid:<set>:<n>` key on the local SQLite path). Indexed
-   * by cell_id; entries may be empty strings if a cell was never loaded. */
+  /** Row-major C × dim raw centroids (unrotated). Centroid scoring runs in
+   * raw float space; only chunk rerank uses TurboQuant. */
+  centroids: Float32Array;
+  /** Entity key per cell_id; packed batches share an entity key across
+   * all cells in the batch. */
   centroidKeys: string[];
+  /** Initialised TurboQuant engine. The browser app keeps this for the
+   * lifetime of the page; CLI scripts can call `tq.destroy()` at exit. */
+  tq: TurboQuant;
   C: number;
   fetchMs: number;
 }
 
 export async function bootstrap(
   api: ApiClient,
-  opts: { centroidSetId?: string; events?: BootstrapEvents } = {},
+  opts: {
+    centroidSetId?: string;
+    events?: BootstrapEvents;
+    cache?: CentroidCache;
+  } = {},
 ): Promise<BootstrapResult> {
   const setId = opts.centroidSetId ?? DEFAULT_CENTROID_SET_ID;
   const ev = opts.events ?? {};
   const t0 = Date.now();
 
+  // --- Manifest -----------------------------------------------------------
   await ev.onManifestStart?.();
   const manifestQ = `kind = "manifest" && model_id = ${dslString(MODEL_ID)} && centroid_set_id = ${dslString(setId)} && ${scopeClause()}`;
-  // We expect exactly one manifest. queryPage suffices and avoids over-fetching
-  // multiple pages from chains (like Arkiv) that always return a cursor.
   const mPage = await api.queryPage(manifestQ, 1, null);
   if (mPage.entities.length === 0)
     throw new Error(`manifest not found for ${MODEL_ID}/${setId}`);
@@ -66,71 +87,128 @@ export async function bootstrap(
     throw new Error(
       `manifest.dim=${manifest.dim} != EMBEDDING_DIM=${EMBEDDING_DIM}`,
     );
+  if (manifest.version !== 2)
+    throw new Error(
+      `manifest version ${manifest.version} unsupported (this client expects v2)`,
+    );
+  if (manifest.emb_quant !== "tq-wasm")
+    throw new Error(
+      `unsupported emb_quant=${manifest.emb_quant} (expected "tq-wasm")`,
+    );
   await ev.onManifestDone?.(manifest, Date.now() - t0);
 
-  const centroidQ = `kind = "centroid" && model_id = ${dslString(MODEL_ID)} && centroid_set_id = ${dslString(setId)} && ${scopeClause()}`;
-  const centroids = new Float32Array(manifest.C * manifest.dim);
-  const centroidKeys: string[] = new Array(manifest.C).fill("");
-  let total = 0;
-  let pageIdx = 0;
-  let pageToken: string | null = null;
-  while (true) {
-    const page = await api.queryPage(centroidQ, 200, pageToken);
-    for (const e of page.entities) {
-      const cid = e.numericAttributes["cell_id"];
-      if (cid === undefined)
-        throw new Error(`centroid ${e.key} missing cell_id`);
-      const vec = decodeCentroidPayload(e, manifest.dim);
-      centroids.set(vec, cid * manifest.dim);
-      centroidKeys[cid] = e.key;
+  // --- TurboQuant engine init + centroid fetch (parallel) -----------------
+  const quantT0 = Date.now();
+  await ev.onQuantizerStart?.();
+  const tqPromise = TurboQuant.init({
+    dim: manifest.tq_dim,
+    seed: manifest.tq_seed,
+  });
+
+  // --- Centroids ----------------------------------------------------------
+  // Cache key is content-derived (`centroid_set_hash`) — a republish under
+  // the same `centroid_set_id` with new centroids gets a new hash and
+  // therefore a new cache entry, so we never serve stale data.
+  const cacheKey = `${MODEL_ID}:${manifest.centroid_set_id}:${manifest.centroid_set_hash}`;
+  let centroids: Float32Array;
+  let centroidKeys: string[];
+  const cached = opts.cache ? await opts.cache.get(cacheKey) : null;
+  if (cached) {
+    centroids = cached.centroids;
+    centroidKeys = cached.centroidKeys;
+    await ev.onCentroidsFromCache?.(manifest.C);
+  } else {
+    const centroidQ = `kind = "centroid" && model_id = ${dslString(MODEL_ID)} && centroid_set_id = ${dslString(setId)} && ${scopeClause()}`;
+    centroids = new Float32Array(manifest.C * manifest.dim);
+    centroidKeys = new Array(manifest.C).fill("");
+    let centTotal = 0;
+    let pageIdx = 0;
+    let pageToken: string | null = null;
+    // Each centroid-bucket payload is K*dim*4 ≈ 122 KB raw → 244 KB hex on
+    // the RPC wire. With pageSize=200 the response would be ~6 MB at
+    // C=2048, blowing the backend body cap. 8 per page → ~2 MB, safe.
+    const CENTROID_PAGE_SIZE = 8;
+    while (true) {
+      const page = await api.queryPage(centroidQ, CENTROID_PAGE_SIZE, pageToken);
+      let pageCentroids = 0;
+      for (const e of page.entities) {
+        const firstCell = e.numericAttributes["first_cell_id"];
+        if (firstCell === undefined)
+          throw new Error(`centroid ${e.key} missing first_cell_id`);
+        const vec = decodeCentroidBatch(e, manifest.dim);
+        const count = vec.length / manifest.dim;
+        if (firstCell + count > manifest.C)
+          throw new Error(
+            `centroid ${e.key}: first_cell_id=${firstCell} + count=${count} > C=${manifest.C}`,
+          );
+        centroids.set(vec, firstCell * manifest.dim);
+        for (let i = 0; i < count; i++) centroidKeys[firstCell + i] = e.key;
+        pageCentroids += count;
+      }
+      centTotal += pageCentroids;
+      pageIdx++;
+      await ev.onCentroidPage?.(pageIdx, pageCentroids, centTotal, manifest.C);
+      if (!page.nextPageToken || page.entities.length === 0) break;
+      pageToken = page.nextPageToken;
+      if (pageIdx > 64) throw new Error("centroid pagination runaway");
     }
-    total += page.entities.length;
-    pageIdx++;
-    await ev.onCentroidPage?.(pageIdx, page.entities.length, total, manifest.C);
-    // Stop on no cursor OR on an empty page — Arkiv returns a cursor even
-    // when the next page is empty, so we can't trust !nextPageToken alone.
-    if (!page.nextPageToken || page.entities.length === 0) break;
-    pageToken = page.nextPageToken;
-    if (pageIdx > 64) throw new Error("centroid pagination runaway");
+    if (centTotal !== manifest.C)
+      throw new Error(`got ${centTotal} centroids, expected ${manifest.C}`);
+    // Best-effort persist for next page load. We don't await this to delay
+    // the bootstrap, but we don't fire-and-forget either — if the write
+    // throws we want it in the console.
+    if (opts.cache) {
+      opts.cache
+        .put(cacheKey, { centroids, centroidKeys })
+        .catch((e) => console.warn("[bootstrap] centroid cache write failed:", e));
+    }
   }
-  if (total !== manifest.C)
-    throw new Error(`got ${total} centroids, expected ${manifest.C}`);
   await ev.onCentroidsDone?.(Date.now() - t0);
+
+  const tq = await tqPromise;
+  await ev.onQuantizerDone?.(Date.now() - quantT0);
 
   return {
     manifest,
     centroids,
     centroidKeys,
+    tq,
     C: manifest.C,
     fetchMs: Date.now() - t0,
   };
 }
 
 export interface SearchResult {
-  text: string;
-  title: string;
+  /** Global chunk id; the dedup key when multi-assignment lands a chunk
+   * in multiple probed cells. */
+  cid: number;
+  /** Public link (Wikipedia URL). Title and extract are fetched from the
+   * Wikipedia summary API by the UI; not stored on chain. */
   url: string;
-  parent_doc_id: string;
+  /** Parent document id — grouping key when multiple chunks of one article
+   * make it into the candidate pool. */
+  pid: string;
   score: number;
+  /** Cells whose buckets returned this chunk (∈ probed cells, length ≥ 1). */
   cellIds: number[];
-  key: string;
+  /** Entity key of one of the buckets it came from — for the Arkiv viewer link. */
+  bucketKey: string;
 }
 
-export const MAX_CHUNKS_PER_GROUP = 3;
-
 export interface SearchResultGroup {
-  parent_doc_id: string;
-  title: string;
+  pid: string;
   url: string;
-  // Top-scoring chunks for this article, ordered by score desc, capped at MAX_CHUNKS_PER_GROUP.
-  chunks: SearchResult[];
-  // Total chunks from this article present in the candidate pool (>= chunks.length).
-  totalInGroup: number;
+  bestScore: number;
+  /** How many distinct chunks of this article appeared in the candidate pool. */
+  hits: number;
+  /** The top-scoring chunk for this article — what the result card displays. */
+  topResult: SearchResult;
 }
 
 export interface SearchStats {
   probedCells: number[];
   pages: number;
+  buckets: number;
   candidates: number;
   termCount: number;
   embedMs: number;
@@ -146,10 +224,6 @@ export type SearchEvent =
       ms: number;
       queryNorm: number;
       qPreview: Float32Array;
-      /** Full L2-normalised query embedding. Consumers that just want a
-       * preview should use `qPreview`; this is the full `dim`-length vector
-       * (currently 384) needed by the 3D viz to project the query into the
-       * centroid PCA space. */
       qVec: Float32Array;
       qStats: { min: number; max: number; meanAbs: number };
     }
@@ -169,7 +243,6 @@ export type SearchEvent =
       ms: number;
       hasMore: boolean;
     }
-  | { type: "rerank:tick"; processed: number; topK: SearchResult[] }
   | {
       type: "done";
       results: SearchResult[];
@@ -190,6 +263,7 @@ export async function search(
   api: ApiClient,
   manifest: Manifest,
   centroids: Float32Array,
+  tq: TurboQuant,
   queryText: string,
   opts: SearchOptions = {},
 ): Promise<{
@@ -205,28 +279,23 @@ export async function search(
   const qVec = await embedOne(queryText);
   l2NormalizeInPlace(qVec);
   const embedMs = Date.now() - embT0;
+
   let qn = 0;
-  for (let i = 0; i < qVec.length; i++) qn += qVec[i]! * qVec[i]!;
-  // Compute a few interpretable stats so the UI can show something more
-  // informative than the always-1.000 L2 norm.
   let qMin = Infinity,
     qMax = -Infinity,
     qAbsSum = 0;
   for (let i = 0; i < qVec.length; i++) {
     const v = qVec[i]!;
+    qn += v * v;
     if (v < qMin) qMin = v;
     if (v > qMax) qMax = v;
     qAbsSum += Math.abs(v);
   }
-  const qPreview = qVec.slice(0, 16);
   await onEvent?.({
     type: "embed:done",
     ms: embedMs,
     queryNorm: Math.sqrt(qn),
-    qPreview,
-    // Share a fresh copy so downstream consumers (e.g. the 3D viz) can
-    // hold onto it without worrying about later mutation. qVec itself is
-    // reused in-place by callers below.
+    qPreview: qVec.slice(0, 16),
     qVec: new Float32Array(qVec),
     qStats: { min: qMin, max: qMax, meanAbs: qAbsSum / qVec.length },
   });
@@ -235,13 +304,11 @@ export async function search(
     api,
     manifest,
     centroids,
+    tq,
     qVec,
     opts,
     embedMs,
   );
-  // The done event from searchByEmbedding already includes totalMs from
-  // its own start; replace it with the wall-clock total here so the embed
-  // step is included in totalMs.
   const stats = { ...inner.stats, totalMs: Date.now() - t0 };
   await onEvent?.({
     type: "done",
@@ -256,6 +323,7 @@ export async function searchByEmbedding(
   api: ApiClient,
   manifest: Manifest,
   centroids: Float32Array,
+  tq: TurboQuant,
   qVec: Float32Array,
   opts: SearchOptions = {},
   embedMs = 0,
@@ -271,6 +339,7 @@ export async function searchByEmbedding(
   const maxPages = opts.maxPages ?? 10;
   const startT = Date.now();
 
+  // Score centroids in raw float space and pick the nprobe nearest.
   const scoreT0 = Date.now();
   const cellScores = scoreCentroids(qVec, centroids, manifest.dim, manifest.C);
   const probedCells = topK(cellScores, nprobe);
@@ -282,47 +351,65 @@ export async function searchByEmbedding(
     ms: scoreMs,
   });
 
-  const ivfPredicate = buildIvfPredicate(probedCells, manifest.M);
-  const termCount = probedCells.length * manifest.M;
-  let dsl = `${ivfPredicate} && kind = "chunk" && model_id = ${dslString(manifest.model_id)} && centroid_set_id = ${dslString(manifest.centroid_set_id)} && ${scopeClause()}`;
+  // Build IVF predicate. v2: cell_id = X1 || cell_id = X2 || ...
+  const ivfPredicate = buildIvfPredicate(probedCells);
+  const termCount = probedCells.length;
+  let dsl = `${ivfPredicate} && kind = "chunk_bucket" && model_id = ${dslString(manifest.model_id)} && centroid_set_id = ${dslString(manifest.centroid_set_id)} && ${scopeClause()}`;
   if (opts.filter) dsl += ` && (${opts.filter})`;
   await onEvent?.({ type: "query:built", dsl, termCount });
 
-  const fetchT0 = Date.now();
-  let pages = 0;
-  let candidates = 0;
+  // Pad the query once to tq_dim (zero-tail) so we can pass to tq.dot/dotBatch.
+  const qPadded = padToTqDim(qVec, manifest.tq_dim);
+
   interface Cand {
     score: number;
-    payload: ChunkPayload;
-    cellIds: number[];
-    key: string;
+    mini: ChunkMini;
+    cellIds: Set<number>;
+    bucketKey: string;
   }
-  const allCandidates: Cand[] = [];
+  const byCid = new Map<number, Cand>();
 
+  const fetchT0 = Date.now();
+  let pages = 0;
+  let buckets = 0;
   let pageToken: string | null = null;
+
+  // Page-loop work is intentionally cheap: just decode buckets and dedupe
+  // chunks by `cid`. Scoring is deferred to a single tq.dotBatch() call
+  // after all pages land (see below). Per-chunk tq.dot() crossed the
+  // JS↔WASM boundary thousands of times — at nprobe=16, ~2400 crossings
+  // were the dominant ~1s freeze users saw between fetch and results.
   while (pages < maxPages) {
     const pageIdx = pages + 1;
     await onEvent?.({ type: "page:start", pageIdx });
     const pageT0 = Date.now();
     const page = await api.queryPage(dsl, pageSize, pageToken);
     pages++;
+    buckets += page.entities.length;
     for (const e of page.entities) {
-      const chunk = decodeChunk(e);
-      const score = dotPackedInt8(qVec, chunk.emb);
-      const cellIds = [
-        e.numericAttributes["cell_id_0"] ?? -1,
-        e.numericAttributes["cell_id_1"] ?? -1,
-        e.numericAttributes["cell_id_2"] ?? -1,
-      ];
-      candidates++;
-      allCandidates.push({ score, payload: chunk, cellIds, key: e.key });
+      const cellId = e.numericAttributes["cell_id"];
+      if (cellId === undefined) continue;
+      const minis = decodeChunkBucket(e);
+      for (const mini of minis) {
+        const existing = byCid.get(mini.cid);
+        if (existing) {
+          existing.cellIds.add(cellId);
+          continue;
+        }
+        byCid.set(mini.cid, {
+          score: 0, // filled in by the batched rerank below
+          mini,
+          cellIds: new Set([cellId]),
+          bucketKey: e.key,
+        });
+      }
     }
     const pageMs = Date.now() - pageT0;
     await onEvent?.({
       type: "page:done",
       pageIdx,
       entities: page.entities.length,
-      totalCandidates: candidates,
+      totalCandidates: byCid.size,
       ms: pageMs,
       hasMore: !!page.nextPageToken,
     });
@@ -331,52 +418,74 @@ export async function searchByEmbedding(
   }
   const fetchMs = Date.now() - fetchT0;
 
-  // Sort all candidates by score desc. We use this both for the flat top-K
-  // (preserves recall-eval semantics) and to derive top-K groups.
-  allCandidates.sort((a, b) => b.score - a.score);
+  // Batched rerank: one WASM (or WebGPU) call instead of N individual
+  // tq.dot() calls. We concatenate every candidate's compressed embedding
+  // into a single Uint8Array and hand it to tq.dotBatch, which returns the
+  // matching score for each. The library transparently uses WebGPU when
+  // available; on devices without it the WASM SIMD fallback is still ~10×
+  // faster than per-vector dot() because it avoids the per-call boundary
+  // overhead.
+  const rerankT0 = Date.now();
+  const candidates = Array.from(byCid.values());
+  if (candidates.length > 0) {
+    const bytesPerVec = manifest.emb_byte_size;
+    const concat = new Uint8Array(candidates.length * bytesPerVec);
+    for (let i = 0; i < candidates.length; i++) {
+      const emb = candidates[i]!.mini.emb;
+      if (emb.byteLength !== bytesPerVec)
+        throw new Error(
+          `candidate ${i} emb size ${emb.byteLength} != ${bytesPerVec}`,
+        );
+      concat.set(emb, i * bytesPerVec);
+    }
+    const scores = await tq.dotBatch(qPadded, concat, bytesPerVec);
+    for (let i = 0; i < candidates.length; i++) {
+      candidates[i]!.score = scores[i]!;
+    }
+  }
+  const rerankMs = Date.now() - rerankT0;
+
+  const all = candidates.sort((a, b) => b.score - a.score);
 
   const toResult = (c: Cand): SearchResult => ({
-    text: c.payload.text,
-    title: c.payload.title,
-    url: c.payload.url,
-    parent_doc_id: c.payload.parent_doc_id,
+    cid: c.mini.cid,
+    url: c.mini.url,
+    pid: c.mini.pid,
     score: c.score,
-    cellIds: c.cellIds,
-    key: c.key,
+    cellIds: Array.from(c.cellIds),
+    bucketKey: c.bucketKey,
   });
-  const results: SearchResult[] = allCandidates.slice(0, k).map(toResult);
+  const results: SearchResult[] = all.slice(0, k).map(toResult);
 
-  // Group all candidates by parent_doc_id, then take top-K groups ordered by
-  // their best chunk's score. Within each group, chunks remain in score-desc
-  // order (the candidate list was already sorted), and we surface up to
-  // MAX_CHUNKS_PER_GROUP of them with a count of the rest.
-  const byDoc = new Map<string, Cand[]>();
-  for (const c of allCandidates) {
-    const arr = byDoc.get(c.payload.parent_doc_id);
+  const byPid = new Map<string, Cand[]>();
+  for (const c of all) {
+    const arr = byPid.get(c.mini.pid);
     if (arr) arr.push(c);
-    else byDoc.set(c.payload.parent_doc_id, [c]);
+    else byPid.set(c.mini.pid, [c]);
   }
-  const groups: SearchResultGroup[] = Array.from(byDoc.entries())
-    .map(([docId, arr]) => {
+  const groups: SearchResultGroup[] = Array.from(byPid.entries())
+    .map(([pid, arr]): SearchResultGroup => {
       const head = arr[0]!;
       return {
-        parent_doc_id: docId,
-        title: head.payload.title,
-        url: head.payload.url,
-        chunks: arr.slice(0, MAX_CHUNKS_PER_GROUP).map(toResult),
-        totalInGroup: arr.length,
+        pid,
+        url: head.mini.url,
+        bestScore: head.score,
+        hits: arr.length,
+        topResult: toResult(head),
       };
     })
-    .sort((a, b) => b.chunks[0]!.score - a.chunks[0]!.score)
+    .sort((a, b) => b.bestScore - a.bestScore)
     .slice(0, k);
+
   const stats: SearchStats = {
     probedCells,
     pages,
-    candidates,
+    buckets,
+    candidates: byCid.size,
     termCount,
     embedMs,
     fetchMs,
-    rerankMs: 0,
+    rerankMs,
     totalMs: Date.now() - startT + embedMs,
   };
   return { results, groups, stats };

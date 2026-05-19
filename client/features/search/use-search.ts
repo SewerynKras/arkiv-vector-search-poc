@@ -8,6 +8,7 @@
 import { useCallback, useReducer } from "react";
 
 import type { ApiClient } from "@arkiv-search/shared/api-client";
+import type { TurboQuant } from "@arkiv-search/shared/quantize";
 import { search as searchShared } from "@arkiv-search/shared/search";
 import type {
   SearchEvent,
@@ -166,8 +167,6 @@ function applyEvent(s: SearchSliceState, ev: SearchEvent): SearchSliceState {
           candidates: ev.totalCandidates,
         },
       };
-    case "rerank:tick":
-      return s;
     case "done":
       return {
         ...s,
@@ -188,17 +187,18 @@ export interface UseSearchArgs {
   api: ApiClient | null;
   manifest: Manifest | null;
   centroids: Float32Array | null;
+  tq: TurboQuant | null;
 }
 
-export function useSearch({ api, manifest, centroids }: UseSearchArgs) {
+export function useSearch({ api, manifest, centroids, tq }: UseSearchArgs) {
   const [state, dispatch] = useReducer(reducer, INITIAL);
 
   const run = useCallback(
     async (queryText: string, k: number, nprobe: number) => {
-      if (!api || !manifest || !centroids) return;
+      if (!api || !manifest || !centroids || !tq) return;
       dispatch({ type: "start", queryText });
       try {
-        await searchShared(api, manifest, centroids, queryText, {
+        await searchShared(api, manifest, centroids, tq, queryText, {
           k,
           nprobe,
           onEvent: (ev) => {
@@ -209,7 +209,7 @@ export function useSearch({ api, manifest, centroids }: UseSearchArgs) {
         dispatch({ type: "error", message: (e as Error).message });
       }
     },
-    [api, manifest, centroids],
+    [api, manifest, centroids, tq],
   );
 
   return { ...state, run };

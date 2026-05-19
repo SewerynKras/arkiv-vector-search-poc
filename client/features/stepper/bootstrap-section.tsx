@@ -75,6 +75,7 @@ export function BootstrapSection({
           total={state.centroids.total}
           expected={state.centroids.expected}
           state={state.centroids.state}
+          fromCache={state.centroids.fromCache}
         />
       </Step>
     </div>

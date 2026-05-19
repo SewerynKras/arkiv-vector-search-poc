@@ -45,7 +45,7 @@ export function ResultsList({
   return (
     <div className="space-y-5">
       {groups.map((g, i) => (
-        <ResultCard key={g.parent_doc_id} group={g} rank={i + 1} delay={i * 25} />
+        <ResultCard key={g.pid} group={g} rank={i + 1} delay={i * 25} />
       ))}
     </div>
   );

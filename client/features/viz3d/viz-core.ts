@@ -1,14 +1,17 @@
 // 3D point-cloud visualisation of cluster centroids.
 //
-// Build pipeline:
-//   1. PCA(centroids → 3 components) at bootstrap, scale to fit a unit cube.
-//   2. Three.js scene with a single Points object backed by a BufferGeometry.
-//      Per-vertex attributes: position (vec3), size (float), color (vec3).
-//   3. OrbitControls for mouse rotate/zoom; touch works too.
-//   4. paintScores(scores)  → colour by query similarity (brightness).
-//      markProbed(cells)    → enlarge + cyan halo for top-nprobe cells.
-//      markHits(cellIds)    → pink ring for cells containing a top-K result.
-//      reset()              → back to neutral grey.
+// The React wrapper (centroid-viz-3d.tsx) runs PCA in a Web Worker and
+// hands the result in via `pcaResult`; this module then scales the 3-component
+// projection to fit a unit cube and renders it as a Three.js Points object
+// with per-vertex (position, size, color, alpha) attributes. OrbitControls
+// drives the camera; mouse + touch work the same.
+//
+// Public update API:
+//   paintScores(scores)  → fade alpha by per-cell similarity rank
+//   markProbed(cells)    → enlarge + Arkiv-blue tint on probed cells
+//   markHits(cellIds)    → Arkiv-orange ring around cells that produced a top-K result
+//   setQueryPoint(qVec)  → black arrow from origin to the query's projection
+//   reset()              → back to neutral
 //
 // Caveat: PCA on 384-D bge embeddings keeps ~10–15% of variance in the top 3
 // components. The visualisation is a useful "shape of the embedding space"
@@ -18,7 +21,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
-import { pca } from '@arkiv-search/shared/pca';
+import { pca, type PcaResult } from '@arkiv-search/shared/pca';
 
 export interface CentroidViz3D {
   /** DOM root that hosts the canvas. */
@@ -159,6 +162,11 @@ export interface CreateCentroidViz3DOpts {
   onHover?: (cellId: number | null) => void;
   /** Fired when the user clicks a point (cellId), or empty space (null). */
   onSelect?: (cellId: number | null) => void;
+  /** Pre-computed PCA result. The React canvas runs PCA in a Web Worker and
+   * hands the result here so we don't block the main thread on ~300 ms of
+   * power iteration during scene init. If omitted (e.g., in tests), we
+   * fall back to computing inline. */
+  pcaResult?: PcaResult;
 }
 
 /** Map a position in [-1, 1]³ to an HSL-derived color. The hue comes from the
@@ -174,15 +182,18 @@ function positionToColor(x: number, y: number, z: number, out: THREE.Color) {
 }
 
 export function createCentroidViz3D(opts: CreateCentroidViz3DOpts): CentroidViz3D {
-  const { container, centroids, C, dim, onHover, onSelect } = opts;
+  const { container, centroids, C, dim, onHover, onSelect, pcaResult } = opts;
 
   // ── PCA → 3D positions ────────────────────────────────────────────────────
-  const t0 = performance.now();
-  const result = pca(centroids, C, dim, 3, { iters: 60 });
+  const result = pcaResult ?? (() => {
+    const t0 = performance.now();
+    const r = pca(centroids, C, dim, 3, { iters: 60 });
+    console.log(`[viz3d] PCA (sync fallback) done in ${(performance.now() - t0).toFixed(0)}ms, variance ratios =`, r.variance.map((v) => v.toFixed(3)));
+    return r;
+  })();
   const positions = new Float32Array(C * 3);
   for (let i = 0; i < C * 3; i++) positions[i] = result.projected[i]!;
   const cubeFit = fitToCube(positions, 1.0);
-  console.log(`[viz3d] PCA done in ${(performance.now() - t0).toFixed(0)}ms, variance ratios =`, result.variance.map((v) => v.toFixed(3)));
 
   // ── three.js setup ────────────────────────────────────────────────────────
   const scene = new THREE.Scene();
@@ -373,14 +384,33 @@ export function createCentroidViz3D(opts: CreateCentroidViz3DOpts): CentroidViz3
 
   // ── State updates ─────────────────────────────────────────────────────────
   let lastScores: Float32Array | null = null;
+  // Cached sort of cell indices by lastScores desc. Invalidated when
+  // `lastScores` changes; reused across markProbed/markHits/select repaints
+  // that don't touch the ranking. Sorting 2048 floats every event was the
+  // dominant cost when paintScores → markProbed → markHits fire back-to-back.
+  let sortedByScore: number[] | null = null;
   const probedSet = new Set<number>();
   const hitSet = new Set<number>();
   let selectedCell: number | null = null;
 
+  // RAF-coalesced repaint. paintScores+markProbed+markHits typically fire
+  // within one React batch; without coalescing we'd run repaint() three
+  // times back-to-back, each iterating C points and re-uploading five VBOs.
+  // With coalescing the three state changes merge into one repaint per frame.
+  let repaintScheduled = false;
+  function scheduleRepaint() {
+    if (repaintScheduled) return;
+    repaintScheduled = true;
+    requestAnimationFrame(() => {
+      repaintScheduled = false;
+      repaint();
+    });
+  }
+
   function selectCell(id: number | null) {
     if (id === selectedCell) return;
     selectedCell = id;
-    repaint();
+    scheduleRepaint();
     onSelect?.(id);
   }
 
@@ -395,9 +425,14 @@ export function createCentroidViz3D(opts: CreateCentroidViz3DOpts): CentroidViz3
   function repaint() {
     if (lastScores) {
       const scores = lastScores;
-      const indices = Array.from({ length: C }, (_, i) => i).sort(
-        (a, b) => scores[b]! - scores[a]!,
-      );
+      // Lazy: recompute sort only when the underlying scores change.
+      if (sortedByScore === null) {
+        const indices = new Array<number>(C);
+        for (let i = 0; i < C; i++) indices[i] = i;
+        indices.sort((a, b) => scores[b]! - scores[a]!);
+        sortedByScore = indices;
+      }
+      const indices = sortedByScore;
       // Exponential decay against rank/C with a strong coefficient. At C=2048:
       //   rank   0 → 1.000   (top match, fully opaque)
       //   rank  20 → 0.925
@@ -472,28 +507,30 @@ export function createCentroidViz3D(opts: CreateCentroidViz3DOpts): CentroidViz3
     container,
     paintScores(scores) {
       lastScores = scores;
+      sortedByScore = null; // invalidate sort cache
       probedSet.clear();
       hitSet.clear();
-      repaint();
+      scheduleRepaint();
     },
     markProbed(cells) {
       probedSet.clear();
       for (const c of cells) if (c >= 0 && c < C) probedSet.add(c);
-      repaint();
+      scheduleRepaint();
     },
     markHits(cells) {
       hitSet.clear();
       for (const c of cells) if (c >= 0 && c < C) hitSet.add(c);
-      repaint();
+      scheduleRepaint();
     },
     reset() {
       lastScores = null;
+      sortedByScore = null;
       probedSet.clear();
       hitSet.clear();
       selectedCell = null;
       controls.autoRotate = true;
       queryArrow.visible = false;
-      repaint();
+      scheduleRepaint();
     },
     pointScreenPos(cellId) {
       if (cellId < 0 || cellId >= C) return null;

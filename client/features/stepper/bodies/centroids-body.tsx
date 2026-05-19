@@ -14,6 +14,7 @@ export interface CentroidsBodyProps {
   total: number;
   expected: number;
   state: StepState;
+  fromCache: boolean;
 }
 
 export function CentroidsBody({
@@ -21,21 +22,30 @@ export function CentroidsBody({
   total,
   expected,
   state,
+  fromCache,
 }: CentroidsBodyProps) {
   return (
     <div className="space-y-2">
       <div className="font-mono text-[11px] text-muted-foreground">
         {state === "pending" && "waiting on manifest…"}
-        {state === "active" && (
+        {state === "active" && !fromCache && (
           <>
             {total.toLocaleString()} / {expected.toLocaleString()} centroids
             loaded
           </>
         )}
-        {state === "done" && <>{total.toLocaleString()} centroids loaded</>}
+        {state === "done" && fromCache && (
+          <>
+            {total.toLocaleString()} centroids restored from IndexedDB cache —
+            no RPC round-trips
+          </>
+        )}
+        {state === "done" && !fromCache && (
+          <>{total.toLocaleString()} centroids loaded</>
+        )}
       </div>
 
-      {pages.length > 0 && (
+      {!fromCache && pages.length > 0 && (
         <div className="space-y-0.5 border-l border-dashed border-border pl-3 font-mono text-[10.5px]">
           {pages.map((p) => (
             <div
