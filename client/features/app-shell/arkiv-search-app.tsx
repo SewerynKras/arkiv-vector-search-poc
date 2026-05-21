@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 
-import { useBootstrap } from "@/features/bootstrap/use-bootstrap"
+import { useBootstrap, type BootstrapState } from "@/features/bootstrap/use-bootstrap"
 import { ExampleQueries } from "@/features/search/example-queries"
 import { ResultsList } from "@/features/search/results-list"
 import { SearchBar, type SearchBarHandle } from "@/features/search/search-bar"
@@ -107,6 +107,8 @@ export function ArkivSearchApp() {
           groups={search.groups}
           running={search.running}
           error={search.error}
+          bootstrapReady={bootstrap.ready}
+          bootstrapStatus={bootstrapStatusLabel(bootstrap)}
         />
       </section>
 
@@ -129,3 +131,27 @@ export function ArkivSearchApp() {
   )
 }
 
+// Human-readable label for the active bootstrap phase. Picks the first step
+// that isn't `done`. Used by the left-column ResultsList loading panel so
+// the user sees more than just a disabled search bar while we set up.
+function bootstrapStatusLabel(b: BootstrapState): string {
+  if (b.connect.state !== "done") return "Connecting to Arkiv…"
+  if (b.model.state !== "done") {
+    const p = b.model.progress
+    if (p && p.status === "progress" && p.total) {
+      const mb = (n: number) => (n / (1024 * 1024)).toFixed(1)
+      return `Loading AI model — ${mb(p.loaded)} / ${mb(p.total)} MB`
+    }
+    return "Loading AI model…"
+  }
+  if (b.manifest.state !== "done") return "Fetching manifest…"
+  if (b.centroids.state !== "done") {
+    if (b.centroids.fromCache)
+      return `Restoring ${b.centroids.total.toLocaleString()} centroids from cache…`
+    if (b.centroids.expected > 0)
+      return `Loading cluster centers — ${b.centroids.total.toLocaleString()} / ${b.centroids.expected.toLocaleString()}`
+    return "Loading cluster centers…"
+  }
+  if (b.quantizer.state !== "done") return "Initialising encoder…"
+  return "Finalising…"
+}

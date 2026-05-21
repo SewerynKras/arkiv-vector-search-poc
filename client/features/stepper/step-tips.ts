@@ -10,7 +10,7 @@ export const STEP_TIPS = {
   manifest:
     "Fetch the index manifest entity — the small JSON record that tells you N, C, M, the model SHA, the centroid-set hash, and the TurboQuant config.",
   centroids:
-    "Fetch every cluster center. The browser holds them in memory and uses them to decide which clusters to search at query time. Centroids are packed 80 per entity, paginated 8 at a time to stay under Arkiv's RPC response budget.",
+    "Fetch every cluster center. The browser holds them in memory and uses them to decide which clusters to search at query time. Centroids are packed 80 per entity (103 entities at C=8192), paginated 8 at a time to stay under Arkiv's RPC response budget.",
 
   // Per-search
   embed:

@@ -3,8 +3,8 @@
 // Always-mounted host for the 3D centroid viz. Lives in the right column
 // below the stepper so PCA + Three.js setup runs once (when centroids finish
 // loading) instead of every time the user expands the centroids step. PCA
-// on 2048 × 384 is ~3-8s in pure JS — paying that on every toggle is a
-// terrible UX.
+// on 8192 × 384 is ~10-25s in pure JS (~1s in the Web Worker we use now) —
+// paying that on every toggle is a terrible UX.
 //
 // Also owns the click-pinned metadata popover: when the user clicks a dot
 // we render a small floating card with cell ID / score / rank / entity key

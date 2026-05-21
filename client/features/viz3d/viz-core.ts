@@ -386,7 +386,7 @@ export function createCentroidViz3D(opts: CreateCentroidViz3DOpts): CentroidViz3
   let lastScores: Float32Array | null = null;
   // Cached sort of cell indices by lastScores desc. Invalidated when
   // `lastScores` changes; reused across markProbed/markHits/select repaints
-  // that don't touch the ranking. Sorting 2048 floats every event was the
+  // that don't touch the ranking. Sorting 8192 floats every event was the
   // dominant cost when paintScores → markProbed → markHits fire back-to-back.
   let sortedByScore: number[] | null = null;
   const probedSet = new Set<number>();
@@ -433,10 +433,10 @@ export function createCentroidViz3D(opts: CreateCentroidViz3DOpts): CentroidViz3
         sortedByScore = indices;
       }
       const indices = sortedByScore;
-      // Exponential decay against rank/C with a strong coefficient. At C=2048:
-      //   rank   0 → 1.000   (top match, fully opaque)
-      //   rank  20 → 0.925
-      //   rank 100 → 0.677
+      // Exponential decay against rank/C with a strong coefficient. At C=8192:
+      //   rank    0 → 1.000   (top match, fully opaque)
+      //   rank   80 → 0.925
+      //   rank  400 → 0.677
       //   rank 200 → 0.458
       //   rank 500 → 0.142
       //   rank 1k  → 0.020

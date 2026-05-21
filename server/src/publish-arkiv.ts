@@ -6,6 +6,7 @@
 //   TX_BYTE_BUDGET=153600 pnpm run publish:arkiv  # raw payload bytes per tx (default 184320 = 180 KB)
 //   START_INDEX=0 pnpm run publish:arkiv   # resume the chunk phase from this entity offset
 //   PHASES=chunks pnpm …                   # publish only some phases
+//   SKIP_DEDUPE=1 pnpm …                   # don't query the chain for existing buckets before chunks phase
 //
 // v2 schema: bucketed chunks + turboquant-wasm embeddings. The rotation
 // matrix is reconstructed deterministically on the client from `tq_seed`
@@ -26,6 +27,9 @@ import {
   PROTOCOL_ATTRIBUTE,
   DEFAULT_EXPIRATION_DAYS,
   BRAGA_EXPLORER_URL,
+  BRAGA_RPC_URL,
+  CREATOR_WALLET_ADDRESS,
+  scopeClause,
 } from "@arkiv-search/shared/arkiv";
 import type { ChunkMini, Manifest } from "@arkiv-search/shared/schema";
 
@@ -34,11 +38,15 @@ import { indexerData, locateModelFile, sha256, fileSize } from "./lib/paths.js";
 
 const FULL = process.env.FULL === "1";
 const SUBSET_DIR = FULL ? indexerData("") : indexerData("arkiv-subset");
+// Default to ivf-v3 for the 100k-article / ~400k-chunk run. The previous
+// ivf-v2 corpus stays addressable on chain under its own centroid_set_id
+// until its 90-day expiration runs out; set CENTROID_SET_ID=ivf-v2
+// explicitly if you need to republish to it.
 const CENTROID_SET_ID =
-  process.env.CENTROID_SET_ID ?? (FULL ? "ivf-v2" : "ivf-subset-v2");
+  process.env.CENTROID_SET_ID ?? (FULL ? "ivf-v3" : "ivf-subset-v2");
 const CORPUS_NAME =
   process.env.CORPUS_NAME ??
-  (FULL ? "wikipedia-simple-20231101" : "wikipedia-simple-20231101-subset");
+  (FULL ? "wikipedia-simple-20231101-100k" : "wikipedia-simple-20231101-subset");
 // Per-mutateEntities byte budget. Each tx packs entities until summed
 // payload would exceed this — so the 120 KB chunk buckets ship alone, the
 // 30 KB ones batch 5 at a time, all without halving. Empirical Arkiv RPC
@@ -50,6 +58,7 @@ const MAX_ENTITIES_PER_TX = Number(process.env.MAX_ENTITIES_PER_TX ?? 100);
 const START_INDEX = Number(process.env.START_INDEX ?? 0);
 const EXP_DAYS = Number(process.env.EXP_DAYS ?? DEFAULT_EXPIRATION_DAYS);
 const DRY_RUN = process.env.DRY_RUN === "1";
+const SKIP_DEDUPE = process.env.SKIP_DEDUPE === "1";
 const PHASES = (process.env.PHASES ?? "manifest,centroids,chunks")
   .split(",")
   .map((s) => s.trim())
@@ -352,6 +361,85 @@ interface PublishOptions {
   startIndex?: number;
 }
 
+// Query the chain for every `chunk_bucket` entity already published under
+// (centroid_set_id, creator) and return the set of (cell_id, bucket_index)
+// pairs it found. We use this to skip already-committed buckets on a resumed
+// publish, which protects us from the failure mode the bench surfaced: the
+// SDK rejects a tx whose receipt-wait timed out, but the tx mined anyway.
+// Naively retrying that bucket would produce a duplicate.
+//
+// `payload: false` keeps the response tiny — we only need the attributes.
+async function fetchExistingChunkBucketKeys(
+  centroidSetId: string,
+  creator: string,
+): Promise<Set<string>> {
+  const q = `${scopeClause()} && kind = "chunk_bucket" && centroid_set_id = "${centroidSetId}" && $creator = "${creator}"`;
+  const found = new Set<string>();
+  let cursor: string | undefined;
+  let pages = 0;
+  while (true) {
+    const opts: Record<string, unknown> = {
+      resultsPerPage: "0xc8",
+      includeData: {
+        key: true,
+        attributes: true,
+        payload: false,
+        contentType: false,
+        expiration: false,
+        creator: false,
+        owner: false,
+      },
+    };
+    if (cursor) opts.cursor = cursor;
+    const r = await fetch(BRAGA_RPC_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "arkiv_query",
+        params: [q, opts],
+      }),
+    });
+    if (!r.ok) throw new Error(`arkiv_query HTTP ${r.status}: ${await r.text()}`);
+    const j = (await r.json()) as {
+      result?: {
+        data: {
+          numericAttributes?: { key: string; value: number | string }[];
+        }[];
+        cursor?: string;
+      };
+      error?: { message: string };
+    };
+    if (j.error) throw new Error(`arkiv_query: ${j.error.message}`);
+    pages++;
+    const data = j.result?.data ?? [];
+    for (const e of data) {
+      let cell = -1;
+      let bucket = -1;
+      for (const a of e.numericAttributes ?? []) {
+        if (a.key === "cell_id") cell = Number(a.value);
+        else if (a.key === "bucket_index") bucket = Number(a.value);
+      }
+      if (cell >= 0 && bucket >= 0) found.add(`${cell}:${bucket}`);
+    }
+    if (!j.result?.cursor || data.length === 0) break;
+    cursor = j.result.cursor;
+    if (pages > 500) throw new Error("fetchExistingChunkBucketKeys: aborting at 500 pages");
+  }
+  return found;
+}
+
+function bucketKey(entity: PreparedEntity): string {
+  let cell = -1;
+  let bucket = -1;
+  for (const a of entity.attributes) {
+    if (a.key === "cell_id" && typeof a.value === "number") cell = a.value;
+    else if (a.key === "bucket_index" && typeof a.value === "number") bucket = a.value;
+  }
+  return `${cell}:${bucket}`;
+}
+
 // Byte-budget batched publish. Walks the entity list packing into each tx
 // until the next entity would push raw-payload bytes over `budget`. On a
 // failure, halves the budget and retries. Single-entity sends that fail are
@@ -535,13 +623,32 @@ async function main() {
     await publishByteBatched(walletClient, cEntities, "centroid");
   }
   if (PHASES.includes("chunks")) {
-    const remaining = chBucketEntities.length - START_INDEX;
+    // Apply the manual START_INDEX cursor (rarely needed now), then ask the
+    // chain which buckets are already committed and drop them. The latter
+    // protects multi-hour publishes from the false-failure case observed in
+    // benching: SDK rejects a tx whose receipt-wait timed out, but the tx
+    // mines anyway → naive retry creates duplicates.
+    let toPublish = chBucketEntities.slice(START_INDEX);
+    if (!SKIP_DEDUPE) {
+      console.log(
+        `\n[chunks] Querying chain for existing buckets under centroid_set_id=${CENTROID_SET_ID}…`,
+      );
+      const dedupT0 = Date.now();
+      const existing = await fetchExistingChunkBucketKeys(
+        CENTROID_SET_ID,
+        CREATOR_WALLET_ADDRESS,
+      );
+      const before = toPublish.length;
+      toPublish = toPublish.filter((e) => !existing.has(bucketKey(e)));
+      const skipped = before - toPublish.length;
+      console.log(
+        `  found ${existing.size} on chain, skipping ${skipped}, ${toPublish.length} to publish (${((Date.now() - dedupT0) / 1000).toFixed(1)}s)`,
+      );
+    }
     console.log(
-      `\n[chunks] Publishing ${remaining} bucket entities (starting at ${START_INDEX})…`,
+      `\n[chunks] Publishing ${toPublish.length} bucket entities…`,
     );
-    await publishByteBatched(walletClient, chBucketEntities, "chunk", {
-      startIndex: START_INDEX,
-    });
+    await publishByteBatched(walletClient, toPublish, "chunk");
   }
 
   console.log(`\nDone.`);

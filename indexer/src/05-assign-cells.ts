@@ -29,9 +29,20 @@ async function main() {
   const t0 = Date.now();
   const idx = new faiss.IndexFlatIP(EMBEDDING_DIM);
   idx.add(Array.from(centroids));
-  const { labels } = idx.search(Array.from(X), M);
-  // faiss returns labels flat, query-major: row i occupies labels[i*M ... i*M+M-1].
-  for (let i = 0; i < N * M; i++) cells[i] = labels[i]!;
+  // Batch the queries: a single `Array.from(X)` on N=322k×384 ≈ 123M elements
+  // trips V8's array length / allocation limits. 50k vectors per call keeps
+  // the boxed-Number temp under ~20M elements.
+  const BATCH = 50_000;
+  for (let i = 0; i < N; i += BATCH) {
+    const end = Math.min(i + BATCH, N);
+    const slice = X.subarray(i * EMBEDDING_DIM, end * EMBEDDING_DIM);
+    const { labels } = idx.search(Array.from(slice), M);
+    // faiss returns labels flat, query-major: row j occupies labels[j*M ... j*M+M-1].
+    for (let k = 0; k < (end - i) * M; k++) cells[i * M + k] = labels[k]!;
+    console.log(
+      `  assigned ${end}/${N} (${(((end - i) / ((Date.now() - t0) / 1000)) || 0).toFixed(0)}/s)`,
+    );
+  }
   console.log(`Assignment done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
   // Histogram per-cell occupancy across all M assignments.

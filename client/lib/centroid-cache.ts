@@ -9,8 +9,8 @@
 // keys (so the UI's "view bucket on Arkiv" link still works). Stored as
 // native typed arrays; structured clone handles the serialization for us.
 //
-// ~3 MB per record at C=2048, dim=384. IndexedDB easily handles that and
-// reads it back in a few ms.
+// ~12 MB per record at C=8192, dim=384 (or ~3 MB at C=2048). IndexedDB
+// easily handles that and reads it back in a few ms.
 
 const DB_NAME = "arkiv-search";
 const STORE = "centroid-sets";

@@ -27,8 +27,9 @@ On a cold first load the client fetches:
 
 - the bge-small ONNX model from R2 (~33 MB; cached by the browser),
 - the manifest entity,
-- ~26 packed centroid-bucket entities from Arkiv (`ivf-v2`, K=80 centroids per
-  entity; cached in IndexedDB by `centroid_set_hash`),
+- the packed centroid-bucket entities from Arkiv (`ivf-v3` ≈ 103 buckets at
+  C=8192, K=80 centroids per entity; cached in IndexedDB by
+  `centroid_set_hash`),
 - the turboquant-wasm engine (embedded in the JS bundle).
 
 ## What's IVF?
@@ -37,7 +38,7 @@ On a cold first load the client fetches:
 via k-means, then file each chunk under the few clusters it sits closest
 to. A query scores its vector against the `C` cluster centres, picks the
 top `nprobe`, and only reranks the chunks filed there — so we avoid
-brute-forcing all 96 k embeddings.
+brute-forcing every embedding in the corpus.
 
 The on-chain query is a flat OR over `nprobe` equalities on a
 single `cell_id` attribute, AND-ed with the project / protocol /
@@ -45,7 +46,7 @@ single `cell_id` attribute, AND-ed with the project / protocol /
 M=3 chunk-bucket entities (one per assigned cell), so the query stays
 simple.
 
-## v2 architecture
+## On-chain architecture
 
 The index is *bucketed* on chain to keep RPC round-trips down at scale:
 
@@ -54,7 +55,8 @@ The index is *bucketed* on chain to keep RPC round-trips down at scale:
   config (`tq_dim`, `tq_seed`, `emb_byte_size`).
 - **Centroid buckets** (~`C/80` entities, `kind="centroid"`) — each entity
   packs K=80 float32 centroids, attribute `first_cell_id` tells the
-  client where the batch lands. At C=2048 this is 26 entities.
+  client where the batch lands. At C=8192 (current `ivf-v3`) this is 103
+  entities.
 - **Chunk buckets** (~thousands, `kind="chunk_bucket"`) — each entity
   carries many chunks (msgpacked) that all belong to the same cell. Each
   chunk is `{ cid, emb, pid, url }`; no raw text. Title and extract are
@@ -82,8 +84,10 @@ We bypass the HF datasets-server HTTP API because it rate-limits past a few
 thousand requests.
 
 ```
-ARTICLES=30000 MIN_LENGTH=500 SEED=42 pnpm fetch
+ARTICLES=100000 MIN_LENGTH=500 SEED=42 pnpm run fetch
 ```
+
+(`pnpm fetch` without `run` collides with pnpm's built-in lockfile-fetch command and silently does nothing.)
 
 → `indexer/data/raw_articles.jsonl`. Requires `indexer/python/.venv` with
 `datasets` + `pyarrow`.
@@ -95,7 +99,7 @@ sentence-sliced. No embedding here — the slow step (3) is kept isolated so
 it can be dispatched to GPU separately.
 
 ```
-CHUNKS=100000 pnpm chunk
+CHUNKS=400000 pnpm chunk
 ```
 
 → `indexer/data/chunks.jsonl`.
@@ -120,7 +124,7 @@ Spherical k-means on the embeddings (`indexer/src/lib/kmeans.ts`). Spherical
 because everything is L2-normalised, so cosine = dot product.
 
 ```
-C=2048 MAX_ITER=25 pnpm centroids
+C=8192 MAX_ITER=25 pnpm centroids
 ```
 
 → `indexer/data/centroids.f32` (C × 384).
@@ -183,5 +187,5 @@ PRIVATE_KEY=0x…   # indexer wallet on Braga; only the publish/cleanup/update s
 `client/.env.local` exposes one optional knob:
 
 ```
-NEXT_PUBLIC_CENTROID_SET_ID=ivf-v2   # point the browser at a different IVF set
+NEXT_PUBLIC_CENTROID_SET_ID=ivf-v3   # point the browser at a different IVF set (default: ivf-v3)
 ```

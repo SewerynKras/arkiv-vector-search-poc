@@ -45,8 +45,13 @@ export interface BootstrapEvents {
 // a new set. The Node CLI doesn't pass one; the browser passes an
 // IndexedDB-backed adapter.
 export interface CentroidCache {
-  get(key: string): Promise<{ centroids: Float32Array; centroidKeys: string[] } | null>;
-  put(key: string, value: { centroids: Float32Array; centroidKeys: string[] }): Promise<void>;
+  get(
+    key: string,
+  ): Promise<{ centroids: Float32Array; centroidKeys: string[] } | null>;
+  put(
+    key: string,
+    value: { centroids: Float32Array; centroidKeys: string[] },
+  ): Promise<void>;
 }
 
 export interface BootstrapResult {
@@ -126,10 +131,15 @@ export async function bootstrap(
     let pageToken: string | null = null;
     // Each centroid-bucket payload is K*dim*4 ≈ 122 KB raw → 244 KB hex on
     // the RPC wire. With pageSize=200 the response would be ~6 MB at
-    // C=2048, blowing the backend body cap. 8 per page → ~2 MB, safe.
+    // C=2048 (or ~25 MB at C=8192), blowing the backend body cap. 8 per
+    // page → ~2 MB, safe at any reasonable C.
     const CENTROID_PAGE_SIZE = 8;
     while (true) {
-      const page = await api.queryPage(centroidQ, CENTROID_PAGE_SIZE, pageToken);
+      const page = await api.queryPage(
+        centroidQ,
+        CENTROID_PAGE_SIZE,
+        pageToken,
+      );
       let pageCentroids = 0;
       for (const e of page.entities) {
         const firstCell = e.numericAttributes["first_cell_id"];
@@ -160,7 +170,9 @@ export async function bootstrap(
     if (opts.cache) {
       opts.cache
         .put(cacheKey, { centroids, centroidKeys })
-        .catch((e) => console.warn("[bootstrap] centroid cache write failed:", e));
+        .catch((e) =>
+          console.warn("[bootstrap] centroid cache write failed:", e),
+        );
     }
   }
   await ev.onCentroidsDone?.(Date.now() - t0);
